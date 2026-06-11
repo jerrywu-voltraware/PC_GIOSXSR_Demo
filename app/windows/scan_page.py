@@ -10,6 +10,7 @@ from qasync import asyncSlot
 
 from ..ble_manager import BleManager
 from ..constants import FILTER_NAME
+from ..diagnostics import diagnostics_log_path, write_diagnostic
 
 
 class ScanPage(QWidget):
@@ -69,9 +70,8 @@ class ScanPage(QWidget):
         for address, name, rssi in self._results:
             if self._filter_enabled and FILTER_NAME not in (name or ""):
                 continue
-            if not name or name == "Unknown Device":
-                continue
-            item = QListWidgetItem(f"[{rssi:>4} dBm]  {name}   ({address})")
+            display_name = name or "(Unknown)"
+            item = QListWidgetItem(f"[{rssi:>4} dBm]  {display_name}   ({address})")
             item.setData(Qt.ItemDataRole.UserRole, (address, name))
             self.list_widget.addItem(item)
 
@@ -83,11 +83,15 @@ class ScanPage(QWidget):
         self._results.clear()
         self.list_widget.clear()
         try:
-            items = await BleManager.scan(timeout=3.0)
+            items = await BleManager.scan(timeout=5.0)
             for dev, adv in items:
-                name = adv.local_name or dev.name or ""
+                name = adv.local_name or dev.name or "(Unknown)"
                 self._results.append((dev.address, name, adv.rssi or 0))
             self._render_list()
+            write_diagnostic(
+                f"BLE scan UI: raw_count={len(self._results)} "
+                f"visible_count={self.list_widget.count()} log={diagnostics_log_path()}"
+            )
             self.status_label.setText(f"找到 {len(self._results)} 個裝置。雙擊或選取後按「連線」。")
         except Exception as e:
             QMessageBox.warning(self, "掃描失敗", f"無法掃描：{e}\n\n請確認藍牙已開啟。")

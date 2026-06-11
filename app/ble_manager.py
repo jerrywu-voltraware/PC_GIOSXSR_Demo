@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
+import importlib.metadata
+import platform
+import sys
 from typing import Callable, Optional
 
 from bleak import BleakClient, BleakScanner
@@ -18,6 +22,50 @@ from .constants import (
     TARGET_SERVICE_UUID_SUFFIXES,
     UUID_PRU_NOTIFY,
 )
+from .diagnostics import diagnostics_log_path, write_diagnostic, write_exception
+
+
+_BLE_ENV_LOGGED = False
+
+
+def _log_ble_environment_once() -> None:
+    global _BLE_ENV_LOGGED
+    if _BLE_ENV_LOGGED:
+        return
+    _BLE_ENV_LOGGED = True
+
+    modules = [
+        "bleak.backends.winrt.scanner",
+        "winrt.windows.devices.bluetooth",
+        "winrt.windows.devices.bluetooth.advertisement",
+        "winrt.windows.devices.bluetooth.genericattributeprofile",
+        "winrt.windows.devices.enumeration",
+        "winrt.windows.foundation",
+        "winrt.windows.foundation.collections",
+        "winrt.windows.storage.streams",
+    ]
+    module_states = []
+    for name in modules:
+        try:
+            importlib.import_module(name)
+            module_states.append(f"{name}=imported")
+        except Exception as exc:
+            module_states.append(f"{name}=error:{exc!r}")
+    module_state = ", ".join(module_states)
+    try:
+        bleak_version = importlib.metadata.version("bleak")
+    except importlib.metadata.PackageNotFoundError:
+        bleak_version = "unknown"
+    write_diagnostic(
+        "BLE environment: "
+        f"frozen={getattr(sys, 'frozen', False)} "
+        f"executable={sys.executable} "
+        f"platform={platform.platform()} "
+        f"python={sys.version.split()[0]} "
+        f"bleak={bleak_version} "
+        f"log={diagnostics_log_path()} "
+        f"modules=[{module_state}]"
+    )
 
 
 class BleManager:
@@ -34,11 +82,22 @@ class BleManager:
     @staticmethod
     async def scan(timeout: float = 2.0) -> list[tuple[BLEDevice, AdvertisementData]]:
         """回傳 (device, adv) list，按 RSSI 由強至弱排序。"""
-        discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
-        # discovered: dict[str, tuple[BLEDevice, AdvertisementData]]
-        items = list(discovered.values())
-        items.sort(key=lambda x: x[1].rssi or -999, reverse=True)
-        return items
+        _log_ble_environment_once()
+        try:
+            write_diagnostic(f"BLE scan: starting timeout={timeout}.")
+            discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
+            # discovered: dict[str, tuple[BLEDevice, AdvertisementData]]
+            items = list(discovered.values())
+            items.sort(key=lambda x: x[1].rssi or -999, reverse=True)
+            detail = "; ".join(
+                f"{dev.address}|{adv.local_name or dev.name or '(Unknown)'}|{adv.rssi}"
+                for dev, adv in items[:30]
+            )
+            write_diagnostic(f"BLE scan: raw_count={len(items)} items={detail}")
+            return items
+        except Exception as exc:
+            write_exception("BLE scan failed", exc)
+            raise
 
     # -------- 連線 --------
     async def connect(self, address: str) -> None:

@@ -20,6 +20,16 @@ hiddenimports = [
     'asyncio',
 ]
 hiddenimports += collect_submodules('winrt')
+hiddenimports += collect_submodules('winrt.windows')
+hiddenimports += collect_submodules('winrt.windows.devices')
+hiddenimports += collect_submodules('winrt.windows.devices.bluetooth')
+hiddenimports += collect_submodules('winrt.windows.devices.bluetooth.advertisement')
+hiddenimports += collect_submodules('winrt.windows.devices.bluetooth.genericattributeprofile')
+hiddenimports += collect_submodules('winrt.windows.devices.enumeration')
+hiddenimports += collect_submodules('winrt.windows.foundation')
+hiddenimports += collect_submodules('winrt.windows.foundation.collections')
+hiddenimports += collect_submodules('winrt.windows.storage')
+hiddenimports += collect_submodules('winrt.windows.storage.streams')
 
 a = Analysis(
     ['main.py'],
@@ -34,7 +44,7 @@ a = Analysis(
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
-    noarchive=False,
+    noarchive=True,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
