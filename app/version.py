@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 APP_NAME = "PC_GIOSXSR_Demo"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 GITHUB_OWNER = "jerrywu-voltraware"
 GITHUB_REPO = "PC_GIOSXSR_Demo"
