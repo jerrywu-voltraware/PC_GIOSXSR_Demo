@@ -66,6 +66,113 @@ def _powershell_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def cleanup_update_artifacts() -> None:
+    """Remove the .old backup left behind by a previous successful update."""
+    if not getattr(sys, "frozen", False):
+        return
+    target = Path(sys.executable).resolve()
+    backup = target.with_name(target.name + ".old")
+    try:
+        if backup.exists():
+            backup.unlink()
+    except OSError:
+        pass
+
+
+def _install_script_text(
+    source: Path,
+    target: Path,
+    wait_pid: int,
+    log_file: Path,
+) -> str:
+    # PyInstaller onefile runs as two processes (bootloader parent + child);
+    # the script must wait for every process backed by the target exe, not
+    # just the Python child's PID, before the image lock is released.
+    return f"""$ErrorActionPreference = 'Stop'
+$source = {_powershell_literal(source)}
+$target = {_powershell_literal(target)}
+$backup = "$target.old"
+$pidToWait = {wait_pid}
+$logFile = {_powershell_literal(log_file)}
+
+function Write-UpdateLog([string]$message) {{
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -LiteralPath $logFile -Value "[$timestamp] $message"
+}}
+
+function Get-TargetProcesses {{
+    Get-Process | Where-Object {{
+        try {{ $_.Path -and [string]::Equals($_.Path, $target, 'OrdinalIgnoreCase') }} catch {{ $false }}
+    }}
+}}
+
+try {{
+    Write-UpdateLog "Waiting for PID $pidToWait and every process running $target to exit."
+    for ($i = 0; $i -lt 120; $i++) {{
+        $running = @()
+        $byPid = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue
+        if ($byPid) {{ $running += $byPid }}
+        $running += @(Get-TargetProcesses)
+        if ($running.Count -eq 0) {{ break }}
+        Start-Sleep -Milliseconds 500
+    }}
+
+    $leftover = @(Get-TargetProcesses)
+    if ($leftover.Count -gt 0) {{
+        Write-UpdateLog "Force stopping leftover processes: $(($leftover | ForEach-Object Id) -join ', ')"
+        $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }}
+
+    $sourceSize = (Get-Item -LiteralPath $source).Length
+    $installed = $false
+
+    for ($attempt = 1; $attempt -le 60; $attempt++) {{
+        try {{
+            if (Test-Path -LiteralPath $backup) {{
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            }}
+            if (Test-Path -LiteralPath $target) {{
+                Move-Item -LiteralPath $target -Destination $backup -Force -ErrorAction Stop
+            }}
+            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+            $targetSize = (Get-Item -LiteralPath $target).Length
+            if ($targetSize -ne $sourceSize) {{
+                throw "Size mismatch after copy: $targetSize vs $sourceSize."
+            }}
+            Write-UpdateLog "Updated $target from $source on attempt $attempt."
+            $installed = $true
+            break
+        }} catch {{
+            Write-UpdateLog "Attempt $attempt failed: $($_.Exception.Message)"
+            if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) {{
+                try {{ Move-Item -LiteralPath $backup -Destination $target -Force -ErrorAction Stop }} catch {{ }}
+            }}
+            Start-Sleep -Seconds 1
+        }}
+    }}
+
+    if (-not $installed) {{
+        Write-UpdateLog "Update failed after all retry attempts. Restarting existing app."
+    }}
+    Start-Process -FilePath $target
+    if ($installed) {{
+        Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }}
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}} catch {{
+    try {{ Write-UpdateLog "Fatal updater error: $($_.Exception.Message)" }} catch {{ }}
+    try {{
+        if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) {{
+            Move-Item -LiteralPath $backup -Destination $target -Force
+        }}
+    }} catch {{ }}
+    try {{ Start-Process -FilePath $target }} catch {{ }}
+}}
+"""
+
+
 def _fetch_latest_release() -> UpdateInfo | None:
     with urllib.request.urlopen(_request(GITHUB_RELEASES_API), timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -271,46 +378,7 @@ class UpdateController(QObject):
         script = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.ps1"
         log_file = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.log"
         script.write_text(
-            f"""$ErrorActionPreference = 'Stop'
-$source = {_powershell_literal(downloaded_exe)}
-$target = {_powershell_literal(target)}
-$pidToWait = {os.getpid()}
-$logFile = {_powershell_literal(log_file)}
-
-function Write-UpdateLog([string]$message) {{
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Add-Content -LiteralPath $logFile -Value "[$timestamp] $message"
-}}
-
-try {{
-    Write-UpdateLog "Waiting for PID $pidToWait to exit."
-    for ($i = 0; $i -lt 120; $i++) {{
-        $process = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue
-        if ($null -eq $process) {{ break }}
-        Start-Sleep -Milliseconds 500
-    }}
-
-    for ($attempt = 1; $attempt -le 60; $attempt++) {{
-        try {{
-            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
-            Write-UpdateLog "Updated $target from $source on attempt $attempt."
-            Start-Process -FilePath $target
-            Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-            exit 0
-        }} catch {{
-            Write-UpdateLog "Attempt $attempt failed: $($_.Exception.Message)"
-            Start-Sleep -Seconds 1
-        }}
-    }}
-
-    Write-UpdateLog "Update failed after all retry attempts. Restarting existing app."
-    Start-Process -FilePath $target
-}} catch {{
-    try {{ Write-UpdateLog "Fatal updater error: $($_.Exception.Message)" }} catch {{ }}
-    try {{ Start-Process -FilePath $target }} catch {{ }}
-}}
-""",
+            _install_script_text(downloaded_exe, target, os.getpid(), log_file),
             encoding="utf-8-sig",
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

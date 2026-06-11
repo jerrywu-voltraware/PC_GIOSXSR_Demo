@@ -7,10 +7,12 @@ import sys
 from PyQt6.QtWidgets import QApplication
 from qasync import QEventLoop
 
+from app.updater import cleanup_update_artifacts
 from app.windows.main_window import MainWindow
 
 
 def main() -> int:
+    cleanup_update_artifacts()
     app = QApplication(sys.argv)
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
