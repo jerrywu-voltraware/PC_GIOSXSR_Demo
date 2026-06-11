@@ -155,7 +155,8 @@ try {{
     if (-not $installed) {{
         Write-UpdateLog "Update failed after all retry attempts. Restarting existing app."
     }}
-    Start-Process -FilePath $target
+    Start-Sleep -Seconds 3
+    Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)
     if ($installed) {{
         Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
@@ -168,7 +169,10 @@ try {{
             Move-Item -LiteralPath $backup -Destination $target -Force
         }}
     }} catch {{ }}
-    try {{ Start-Process -FilePath $target }} catch {{ }}
+    try {{
+        Start-Sleep -Seconds 3
+        Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)
+    }} catch {{ }}
 }}
 """
 

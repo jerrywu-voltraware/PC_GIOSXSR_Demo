@@ -1,23 +1,32 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
+
+hiddenimports = [
+    'qasync',
+    'bleak',
+    'bleak.backends.winrt',
+    'bleak.backends.winrt.scanner',
+    'bleak.backends.winrt.client',
+    'bleak.backends.winrt.characteristic',
+    'bleak.backends.winrt.descriptor',
+    'bleak.backends.winrt.service',
+    'bleak.backends.winrt.util',
+    'PyQt6.QtCore',
+    'PyQt6.QtGui',
+    'PyQt6.QtWidgets',
+    'asyncio',
+]
+hiddenimports += collect_submodules('winrt')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[
-        'qasync',
-        'bleak',
-        'bleak.backends.winrt',
-        'bleak.backends.winrt.scanner',
-        'bleak.backends.winrt.client',
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'PyQt6.QtWidgets',
-        'asyncio',
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
