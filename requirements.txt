@@ -1,0 +1,4 @@
+PyQt6>=6.6
+bleak>=0.22
+qasync>=0.27
+pyserial>=3.5

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+env/
+.claude/
+
+build/
+dist/
+
+dac_config.json
+*.log
+*.tmp
