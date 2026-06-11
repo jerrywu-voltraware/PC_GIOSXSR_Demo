@@ -62,6 +62,10 @@ def _request(url: str) -> urllib.request.Request:
     )
 
 
+def _powershell_literal(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _fetch_latest_release() -> UpdateInfo | None:
     with urllib.request.urlopen(_request(GITHUB_RELEASES_API), timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -264,32 +268,63 @@ class UpdateController(QObject):
 
     def _install_update(self, downloaded_exe: Path) -> None:
         target = Path(sys.executable).resolve()
-        script = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.bat"
+        script = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.ps1"
+        log_file = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.log"
         script.write_text(
-            "\n".join(
-                [
-                    "@echo off",
-                    "setlocal",
-                    f'set "SOURCE={downloaded_exe}"',
-                    f'set "TARGET={target}"',
-                    f'set "PID={os.getpid()}"',
-                    ":wait",
-                    'tasklist /FI "PID eq %PID%" | findstr /C:"%PID%" >nul',
-                    "if not errorlevel 1 (",
-                    "  timeout /t 1 /nobreak >nul",
-                    "  goto wait",
-                    ")",
-                    'copy /Y "%SOURCE%" "%TARGET%" >nul',
-                    'start "" "%TARGET%"',
-                    'del "%SOURCE%" >nul 2>nul',
-                    'del "%~f0" >nul 2>nul',
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+            f"""$ErrorActionPreference = 'Stop'
+$source = {_powershell_literal(downloaded_exe)}
+$target = {_powershell_literal(target)}
+$pidToWait = {os.getpid()}
+$logFile = {_powershell_literal(log_file)}
+
+function Write-UpdateLog([string]$message) {{
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -LiteralPath $logFile -Value "[$timestamp] $message"
+}}
+
+try {{
+    Write-UpdateLog "Waiting for PID $pidToWait to exit."
+    for ($i = 0; $i -lt 120; $i++) {{
+        $process = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue
+        if ($null -eq $process) {{ break }}
+        Start-Sleep -Milliseconds 500
+    }}
+
+    for ($attempt = 1; $attempt -le 60; $attempt++) {{
+        try {{
+            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+            Write-UpdateLog "Updated $target from $source on attempt $attempt."
+            Start-Process -FilePath $target
+            Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+            exit 0
+        }} catch {{
+            Write-UpdateLog "Attempt $attempt failed: $($_.Exception.Message)"
+            Start-Sleep -Seconds 1
+        }}
+    }}
+
+    Write-UpdateLog "Update failed after all retry attempts. Restarting existing app."
+    Start-Process -FilePath $target
+}} catch {{
+    try {{ Write-UpdateLog "Fatal updater error: $($_.Exception.Message)" }} catch {{ }}
+    try {{ Start-Process -FilePath $target }} catch {{ }}
+}}
+""",
+            encoding="utf-8-sig",
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(["cmd.exe", "/c", str(script)], creationflags=creation_flags)
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            creationflags=creation_flags,
+        )
         QApplication.quit()
 
     def _start_worker(self, worker: QObject, finished_slot) -> None:
