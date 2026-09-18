@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QTimer
 from qasync import QEventLoop
 
 from app.ble_manager import BleManager
 from app.diagnostics import diagnostics_log_path, write_diagnostic, write_exception
 from app.updater import cleanup_update_artifacts
 from app.windows.main_window import MainWindow
+from app.theme import apply_theme
+from app.version import APP_VERSION
 
 
 def _prepare_windows_ble_runtime() -> None:
@@ -36,17 +40,30 @@ async def _ble_scan_smoke() -> int:
 
 
 def main() -> int:
+    if sys.platform.startswith("win"):
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GIOS.PC.GIOSXSR.Demo")
     _prepare_windows_ble_runtime()
     cleanup_update_artifacts()
     if "--ble-scan-smoke" in sys.argv:
         return asyncio.run(_ble_scan_smoke())
 
+    ui_smoke = "--ui-smoke" in sys.argv
+    if ui_smoke:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication(sys.argv)
+    apply_theme(app)
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    window = MainWindow()
+    window = MainWindow(check_updates=not ui_smoke)
     window.show()
+    if ui_smoke:
+        assert window.stack.count() == 5
+        assert not hasattr(window, "dac_page")
+        assert not window.windowIcon().isNull()
+        write_diagnostic(f"UI smoke: version={APP_VERSION}; 5 pages, OTA entry present, no DAC; startup OK.")
+        QTimer.singleShot(250, window.close)
 
     with loop:
         loop.run_forever()

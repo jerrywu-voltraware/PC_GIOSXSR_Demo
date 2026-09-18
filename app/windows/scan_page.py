@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
 from qasync import asyncSlot
 
 from ..ble_manager import BleManager
-from ..constants import FILTER_NAME
 from ..diagnostics import diagnostics_log_path, write_diagnostic
 
 
@@ -20,7 +19,6 @@ class ScanPage(QWidget):
         super().__init__(parent)
         self.ble = ble
         self._results: list[tuple[str, str, int]] = []  # (address, name, rssi)
-        self._filter_enabled = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -51,29 +49,54 @@ class ScanPage(QWidget):
         self.scan_btn.clicked.connect(self.start_scan)
         self.connect_btn = QPushButton("連線選取裝置")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
+        self.disconnect_btn = QPushButton("斷線選取裝置")
+        self.disconnect_btn.clicked.connect(self._disconnect_selected)
 
         bottom.addStretch(1)
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.connect_btn)
+        bottom.addWidget(self.disconnect_btn)
         root.addLayout(bottom)
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #555;")
         root.addWidget(self.status_label)
 
-    def _on_filter_toggled(self, checked: bool) -> None:
-        self._filter_enabled = checked
-        self._render_list()
-
     def _render_list(self) -> None:
         self.list_widget.clear()
-        for address, name, rssi in self._results:
-            if self._filter_enabled and FILTER_NAME not in (name or ""):
+        connected = dict(self.ble.connected_devices())
+        items = [(address, name, 0) for address, name in connected.items()]
+        items += [item for item in self._results if item[0] not in connected]
+        for address, name, rssi in items:
+            if not name or name in ("Unknown Device", "(Unknown)"):
                 continue
             display_name = name or "(Unknown)"
-            item = QListWidgetItem(f"[{rssi:>4} dBm]  {display_name}   ({address})")
+            prefix = "已連線" if address in connected else f"{rssi:>4} dBm"
+            item = QListWidgetItem(f"[{prefix}]  {display_name}   ({address})")
             item.setData(Qt.ItemDataRole.UserRole, (address, name))
             self.list_widget.addItem(item)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._render_list()
+
+    @asyncSlot()
+    async def _disconnect_selected(self):
+        item = self.list_widget.currentItem()
+        if not item or not self.connect_btn.isEnabled():
+            return
+        address, name = item.data(Qt.ItemDataRole.UserRole)
+        if address not in dict(self.ble.connected_devices()):
+            return
+        self.disconnect_btn.setEnabled(False)
+        self.connect_btn.setEnabled(False)
+        try:
+            await self.ble.connect(address)
+            await self.ble.disconnect()
+            self._render_list()
+        finally:
+            self.disconnect_btn.setEnabled(True)
+            self.connect_btn.setEnabled(True)
 
     @asyncSlot()
     async def start_scan(self) -> None:
@@ -83,7 +106,7 @@ class ScanPage(QWidget):
         self._results.clear()
         self.list_widget.clear()
         try:
-            items = await BleManager.scan(timeout=5.0)
+            items = await BleManager.scan(timeout=2.0)
             for dev, adv in items:
                 name = adv.local_name or dev.name or "(Unknown)"
                 self._results.append((dev.address, name, adv.rssi or 0))
@@ -112,12 +135,16 @@ class ScanPage(QWidget):
 
     @asyncSlot()
     async def _connect_to_item(self, item: QListWidgetItem) -> None:
+        if not self.connect_btn.isEnabled():
+            return
         address, name = item.data(Qt.ItemDataRole.UserRole)
         self.connect_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(False)
         self.scan_btn.setEnabled(False)
         self.status_label.setText(f"連線 {name} ...")
         try:
             await self.ble.connect(address)
+            self.ble.device_names[address] = name
             self.status_label.setText(f"已連線 {name}")
             self.device_connected.emit(address, name)
         except Exception as e:
@@ -125,4 +152,5 @@ class ScanPage(QWidget):
             self.status_label.setText("連線失敗")
         finally:
             self.connect_btn.setEnabled(True)
+            self.disconnect_btn.setEnabled(True)
             self.scan_btn.setEnabled(True)

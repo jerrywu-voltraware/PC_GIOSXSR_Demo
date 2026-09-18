@@ -1,160 +1,185 @@
-"""MainWindow — 左右分割：左側 BLE 操作流程，右側 DAC 工具可收折（抽屜式）。"""
+﻿"""Desktop routes matching the mobile app; no DAC tool."""
 from __future__ import annotations
-
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QMainWindow, QStackedWidget, QMessageBox, QHBoxLayout, QWidget, QPushButton
+import asyncio
+from pathlib import Path
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QMessageBox
 from qasync import asyncSlot
-
 from ..ble_manager import BleManager
+from ..constants import UUID_PRU_CONTROL
 from ..updater import UpdateController
 from ..version import APP_VERSION
 from .scan_page import ScanPage
 from .menu_page import MenuPage
 from .info_page import InfoPage
 from .pru_test_page import PruTestPage
-from .dac_tool_page import DacToolPage
+from .ota_page import OtaPage
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    disconnected = pyqtSignal()
+
+    def __init__(self, check_updates=True):
         super().__init__()
+        icon = QIcon(str(Path(__file__).resolve().parents[2] / "1024.png"))
+        self.setWindowIcon(icon)
+        QApplication.instance().setWindowIcon(icon)
         self.setWindowTitle(f"GIOS BLE SR PC Demo v{APP_VERSION}")
-        self.resize(700, 750)
-
+        self.resize(960, 850)
         self.ble = BleManager()
-        self.ble.set_disconnected_callback(self._on_ble_disconnected)
+        self.ble.set_disconnected_callback(self.disconnected.emit)
+        self.disconnected.connect(self._show_disconnect_ui)
+        self._closing = False
+        self._closed = False
+        self._starting_ota = False
+        self._disconnect_cleanup = None
         self.update_controller = UpdateController(self)
-        self._build_app_menu()
-
-        # ── 左側：BLE 頁面堆疊 ──
+        action = QAction("Check for updates", self)
+        action.triggered.connect(lambda: self.update_controller.check_for_updates(manual=True))
+        self.menuBar().addMenu("Help").addAction(action)
         self.stack = QStackedWidget()
-
+        self.setCentralWidget(self.stack)
         self.scan_page = ScanPage(self.ble)
         self.menu_page = MenuPage()
         self.info_page = InfoPage(self.ble)
         self.pru_page = PruTestPage(self.ble)
-
-        self.stack.addWidget(self.scan_page)   # index 0
-        self.stack.addWidget(self.menu_page)   # index 1
-        self.stack.addWidget(self.info_page)   # index 2
-        self.stack.addWidget(self.pru_page)    # index 3
-
-        # ── 右側：DAC 工具（抽屜式，預設收起）──
-        self.dac_page = DacToolPage()
-        self.dac_page.auto_load()
-        self.dac_page.setVisible(False)       # 預設收起
-        self._dac_open = False
-
-        # ── 切換按鈕（垂直窄條，常駐於左右面板之間）──
-        self.dac_toggle_btn = QPushButton("▶")
-        self.dac_toggle_btn.setFixedWidth(22)
-        self.dac_toggle_btn.setToolTip("展開 / 收起 DAC 工具面板")
-        self.dac_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.dac_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background: #dce8f8;
-                border: none;
-                border-left: 1px solid #b0c4de;
-                font-size: 13px;
-                color: #1a73e8;
-            }
-            QPushButton:hover { background: #b8d0f0; }
-        """)
-        self.dac_toggle_btn.clicked.connect(self._toggle_dac)
-
-        # ── 中央佈局 ──
-        central = QWidget()
-        h = QHBoxLayout(central)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(0)
-        h.addWidget(self.stack, 1)
-        h.addWidget(self.dac_toggle_btn)
-        h.addWidget(self.dac_page)
-        self.setCentralWidget(central)
-
-        # Signals
+        self.ota_page = OtaPage(self.ble)
+        for page in (self.scan_page, self.menu_page, self.info_page, self.pru_page, self.ota_page):
+            self.stack.addWidget(page)
         self.scan_page.device_connected.connect(self._on_connected)
         self.menu_page.open_info.connect(self._open_info)
         self.menu_page.open_pru_test.connect(self._open_pru)
-        self.menu_page.disconnect_requested.connect(self._disconnect_and_back)
+        self.menu_page.open_ota.connect(self._start_ota)
+        self.menu_page.disconnect_requested.connect(self._back_to_scan)
         self.info_page.back_requested.connect(self._back_to_menu)
         self.pru_page.back_requested.connect(self._back_to_menu)
+        self.ota_page.back_requested.connect(self._disconnect_and_back)
+        QApplication.instance().applicationStateChanged.connect(self._application_state)
+        if check_updates:
+            QTimer.singleShot(1500, self.update_controller.check_for_updates)
 
-        self.stack.setCurrentWidget(self.scan_page)
-        QTimer.singleShot(1500, self.update_controller.check_for_updates)
+    def _application_state(self, state):
+        if self.pru_page.controller:
+            # Desktop inactive includes dialogs; only minimization/hidden pauses.
+            self.pru_page.controller.set_foreground(not self.isMinimized() and self.isVisible())
 
-    def _build_app_menu(self) -> None:
-        help_menu = self.menuBar().addMenu("Help")
-        check_update_action = QAction("Check for updates", self)
-        check_update_action.triggered.connect(
-            lambda _checked=False: self.update_controller.check_for_updates(manual=True)
-        )
-        help_menu.addAction(check_update_action)
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, "pru_page"):
+            self._application_state(None)
 
-    # ------------- DAC 抽屜切換 -------------
-    def _toggle_dac(self) -> None:
-        self._dac_open = not self._dac_open
-        self.dac_page.setVisible(self._dac_open)
-        self.dac_toggle_btn.setText("◀" if self._dac_open else "▶")
-        if self._dac_open:
-            self.resize(1400, self.height())
-        else:
-            self.resize(700, self.height())
-
-    # ------------- 頁面切換 -------------
-    def _on_connected(self, address: str, name: str) -> None:
+    def _on_connected(self, address, name):
         self.menu_page.set_device_name(f"{name} ({address})")
-        self.stack.setCurrentWidget(self.menu_page)
+        if name == "OTAServiceMgr":
+            self.stack.setCurrentWidget(self.ota_page)
+            self.ota_page.enter_page()
+        else:
+            self.stack.setCurrentWidget(self.menu_page)
 
-    def _open_info(self) -> None:
+    def _open_info(self):
         self.stack.setCurrentWidget(self.info_page)
 
-    def _open_pru(self) -> None:
+    def _open_pru(self):
         self.stack.setCurrentWidget(self.pru_page)
-        # 啟動 notify + 首次 refresh
         self.pru_page.enter_page()
 
-    def _back_to_menu(self) -> None:
-        self.pru_page.leave_page()
+    @asyncSlot()
+    async def _back_to_menu(self):
+        task = self.pru_page.leave_page()
+        if task:
+            await task
+        await self.info_page.leave_page()
         self.stack.setCurrentWidget(self.menu_page)
 
     @asyncSlot()
-    async def _disconnect_and_back(self) -> None:
-        self.pru_page.leave_page()
-        try:
-            await self.ble.disable_all_notify()
-        except Exception:
-            pass
-        try:
-            await self.ble.disconnect()
-        except Exception:
-            pass
+    async def _back_to_scan(self):
+        task = self.pru_page.leave_page()
+        if task:
+            await task
+        await self.info_page.leave_page()
         self.stack.setCurrentWidget(self.scan_page)
 
-    # ------------- 斷線處理 -------------
-    def _on_ble_disconnected(self) -> None:
-        """bleak 從 asyncio thread 呼叫。用 singleShot 轉回 UI thread。"""
-        QTimer.singleShot(0, self._show_disconnect_ui)
+    @asyncSlot()
+    async def _disconnect_and_back(self):
+        task = self.pru_page.leave_page()
+        if task:
+            await task
+        await self.info_page.leave_page()
+        await self.ble.disable_all_notify()
+        await self.ble.disconnect()
+        self.stack.setCurrentWidget(self.scan_page)
 
-    def _show_disconnect_ui(self) -> None:
-        self.pru_page.set_reconnect_status("⚠️ 已斷線，請重新掃描連線")
-        # 自動退回掃描頁
-        if self.stack.currentWidget() is not self.scan_page:
-            self.stack.setCurrentWidget(self.scan_page)
-            QMessageBox.information(self, "斷線", "裝置已斷線，請重新掃描並連線。")
-        self.pru_page.set_reconnect_status("")
-
-    # ------------- 關閉 -------------
-    def closeEvent(self, event) -> None:
-        # 清理 DAC serial 連線
-        self.dac_page.cleanup()
-        # 盡力同步清理 BLE
+    @asyncSlot()
+    async def _start_ota(self):
+        if self._starting_ota:
+            return
+        confirmed = QMessageBox.question(self, "確認更新", "這將會讓設備進入 OTA 更新模式並斷開目前的連線。確定要繼續嗎？")
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        self._starting_ota = True
+        self.menu_page.setEnabled(False)
         try:
-            import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(self.ble.disconnect())
-        except Exception:
-            pass
-        super().closeEvent(event)
+            # Start-OTA uses contains, unlike the PRU controller's endsWith.
+            char = next((c for s in self.ble.services()
+                         if any(suffix in str(s.uuid).lower() for suffix in ("fffe", "bbbb"))
+                         for c in s.characteristics if str(c.uuid).lower() == UUID_PRU_CONTROL), None)
+            if char is None:
+                raise RuntimeError("找不到控制用的藍牙特徵值")
+            await self.ble.write(char, [8, 0, 0, 0, 0], response=False)
+            await asyncio.sleep(1)
+            await self.ble.disconnect()
+            self.stack.setCurrentWidget(self.scan_page)
+        except Exception as exc:
+            QMessageBox.warning(self, "OTA 流程出錯", str(exc))
+        finally:
+            self._starting_ota = False
+            self.menu_page.setEnabled(True)
+
+    def _show_disconnect_ui(self):
+        if self._closing or self._starting_ota:
+            return
+        if self.stack.currentWidget() is self.pru_page:
+            if self.pru_page.controller:
+                self.pru_page.controller.on_disconnected()
+            return
+        if self.stack.currentWidget() is self.ota_page:
+            self.ota_page.on_disconnected()
+            self.stack.setEnabled(False)
+            self._disconnect_cleanup = asyncio.create_task(self._finish_ota_disconnect())
+            return
+        self.info_page.cancel_pending_notify()
+        self.stack.setCurrentWidget(self.scan_page)
+        self.scan_page.status_label.setText("裝置已斷線，請重新掃描連線。")
+
+    async def _finish_ota_disconnect(self):
+        try:
+            await self.ota_page.close_session()
+            self.stack.setCurrentWidget(self.scan_page)
+            self.scan_page.status_label.setText("OTA 裝置已斷線，請重新掃描並確認韌體版本。")
+        finally:
+            self.stack.setEnabled(True)
+
+    def closeEvent(self, event):
+        if self._closed:
+            event.accept()
+            return
+        event.ignore()
+        if not self._closing:
+            self._closing = True
+            asyncio.ensure_future(self._shutdown())
+
+    async def _shutdown(self):
+        try:
+            await self.ota_page.close_session()
+            if self._disconnect_cleanup:
+                await self._disconnect_cleanup
+            task = self.pru_page.leave_page()
+            if task:
+                await task
+            await self.info_page.leave_page()
+            await self.ble.disable_all_notify()
+            await self.ble.disconnect_all()
+        finally:
+            self._closed = True
+            self.close()

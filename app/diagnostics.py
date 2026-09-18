@@ -24,9 +24,8 @@ def diagnostics_log_path() -> Path:
 def write_diagnostic(message: str) -> None:
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        diagnostics_log_path().open("a", encoding="utf-8").write(
-            f"[{timestamp}] {message}\n"
-        )
+        with diagnostics_log_path().open("a", encoding="utf-8") as stream:
+            stream.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
 

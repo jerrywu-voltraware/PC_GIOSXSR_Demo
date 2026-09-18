@@ -1,5 +1,6 @@
 """設備資訊頁 — 對照 Flutter device_info_screen.dart。列出所有 service + characteristic。"""
 from __future__ import annotations
+import asyncio
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
@@ -29,6 +30,7 @@ class InfoPage(QWidget):
     def __init__(self, ble: BleManager, parent=None):
         super().__init__(parent)
         self.ble = ble
+        self._notify_task = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -72,6 +74,10 @@ class InfoPage(QWidget):
                 self.tree.addTopLevelItem(svc_item)
                 svc_item.setExpanded(True)
             self.status_label.setText(f"共 {len(services)} 個 service")
+            if self._notify_task:
+                self._notify_task.cancel()
+            if len(services) > 2 and services[2].characteristics:
+                self._notify_task = asyncio.create_task(self._enable_info_notify(services[2].characteristics[0].uuid))
         except Exception as e:
             QMessageBox.warning(self, "錯誤", f"載入 services 失敗：{e}")
             self.status_label.setText("載入失敗")
@@ -80,3 +86,21 @@ class InfoPage(QWidget):
         super().showEvent(event)
         # 每次進頁面自動載入
         self.load_services()
+
+    async def _enable_info_notify(self, uuid):
+        await asyncio.sleep(1)
+        try:
+            await self.ble.enable_notify(uuid)
+        except Exception as exc:
+            self.status_label.setText(f"通知啟用失敗：{exc}")
+
+    async def leave_page(self):
+        if self._notify_task:
+            self._notify_task.cancel()
+            await asyncio.gather(self._notify_task, return_exceptions=True)
+            self._notify_task = None
+        await self.ble.disable_all_notify()
+
+    def cancel_pending_notify(self):
+        if self._notify_task:
+            self._notify_task.cancel()

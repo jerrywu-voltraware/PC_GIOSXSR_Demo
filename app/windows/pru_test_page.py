@@ -1,409 +1,233 @@
-"""PRU 測試頁 — 對照 Flutter device_pru_test_screen.dart + pru_static/dynamic_info_card.dart。
-
-布局：
- ┌─────────────────────────────────────────────┐
- │ [← 返回]           [重連狀態 banner]          │
- ├─────────────────────────────────────────────┤
- │ PTU Static Param [dropdown] [發送]           │
- │ PRU Control      [dropdown] [發送]           │
- ├─────────────────────────────────────────────┤
- │ PRU Static Info  [刷新]                      │
- │   (20B 解析欄位)                              │
- ├─────────────────────────────────────────────┤
- │ PRU Dynamic Info [刷新] [自動刷新 ▶/⏸]       │
- │   Validity 表格                               │
- │   (8 個量測欄位)                              │
- │   PRU Alert 表格                              │
- │   Tester Command                              │
- └─────────────────────────────────────────────┘
-"""
+"""PRU desktop view driven exclusively by the mobile-equivalent controller."""
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
-
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel,
-    QComboBox, QGroupBox, QScrollArea, QMessageBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
+    QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QMessageBox,
 )
 from qasync import asyncSlot
-
-from ..ble_manager import BleManager
-from ..constants import (
-    PACKET_STATIC_PARAMETER, PACKET_CONTROL,
-    UUID_PTU_STATIC_PARAM, UUID_PRU_CONTROL,
-    UUID_PRU_STATIC_READ, UUID_PRU_DYNAMIC_READ,
-    UUID_PRU_NOTIFY,
-    VALIDITY_BIT_LABELS, DYNAMIC_ALERT_BIT_LABELS,
-)
-from ..protocol import (
-    parse_pru_static, parse_pru_dynamic,
-    parse_alert_byte, format_mac_from_notify, get_bits_msb,
-)
+from ..constants import PACKET_CONTROL, PACKET_STATIC_PARAMETER
+from .dynamic_info_card import DynamicInfoCard
+from ..pru_controller import PruController
 
 
-# -------------------------------------------------------------------
-# PRU Static Info 卡
-# -------------------------------------------------------------------
-class PruStaticInfoCard(QGroupBox):
-    def __init__(self, ble: BleManager, parent=None):
-        super().__init__("PRU Static Info", parent)
-        self.ble = ble
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        top = QHBoxLayout()
+class InfoCard(QGroupBox):
+    def __init__(self, title):
+        super().__init__(title)
+        layout = QVBoxLayout(self)
         self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.clicked.connect(self.refresh)
-        self.updated_label = QLabel("")
-        self.updated_label.setStyleSheet("color: #555; font-size: 11px;")
-        top.addStretch(1)
-        top.addWidget(self.updated_label)
-        top.addWidget(self.refresh_btn)
-        root.addLayout(top)
+        layout.addWidget(self.refresh_btn)
+        self.status = QLabel()
+        layout.addWidget(self.status)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["欄位", "值"])
+        self.tree.setColumnWidth(0, 300)
+        self.tree.setMinimumHeight(250)
+        layout.addWidget(self.tree)
+        self._rows = None
 
-        self.grid = QGridLayout()
-        self.grid.setColumnMinimumWidth(0, 340)
-        self.grid.setColumnMinimumWidth(1, 600)
-        self.grid.setColumnStretch(0, 0)
-        self.grid.setColumnStretch(1, 1)
-        self.grid.setVerticalSpacing(6)
-        root.addLayout(self.grid)
-
-    def _clear_grid(self) -> None:
-        while self.grid.count():
-            it = self.grid.takeAt(0)
-            w = it.widget()
-            if w:
-                w.deleteLater()
-
-    def _render(self, lines: list[tuple[str, str]]) -> None:
-        from PyQt6.QtWidgets import QSizePolicy
-        self._clear_grid()
-        for row, (k, v) in enumerate(lines):
-            key_lbl = QLabel(k)
-            key_lbl.setStyleSheet("font-weight: bold;")
-            key_lbl.setWordWrap(True)
-            key_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            key_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-            val_lbl = QLabel(v)
-            val_lbl.setStyleSheet("color: #c00;")
-            val_lbl.setWordWrap(False)
-            val_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            self.grid.addWidget(key_lbl, row, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            self.grid.addWidget(val_lbl, row, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-
-    @asyncSlot()
-    async def refresh(self) -> None:
-        if not self.ble.is_connected:
-            return
-        try:
-            data = await self.ble.read(UUID_PRU_STATIC_READ)
-        except Exception as e:
-            self._render([("讀取失敗", str(e))])
-            return
-        info = parse_pru_static(list(data))
-        self._render(info.as_display_lines())
-        self.updated_label.setText(f"更新時間: {datetime.now().strftime('%H:%M:%S')}")
+    def render(self, rows, error, loading, updated):
+        stamp = datetime.fromtimestamp(time.time() - (time.monotonic() - updated)).strftime("%H:%M:%S") if updated else "—"
+        self.status.setText(error or ("讀取中…" if loading else f"最後更新 {stamp}"))
+        if rows != self._rows:
+            self._rows = rows
+            self.tree.clear()
+            for key, value in rows:
+                self.tree.addTopLevelItem(QTreeWidgetItem([key, value]))
 
 
-# -------------------------------------------------------------------
-# PRU Dynamic Info 卡
-# -------------------------------------------------------------------
-class PruDynamicInfoCard(QGroupBox):
-    def __init__(self, ble: BleManager, parent=None):
-        super().__init__("PRU Dynamic Info", parent)
-        self.ble = ble
-        self._auto_timer = QTimer(self)
-        self._auto_timer.setInterval(1000)
-        self._auto_timer.timeout.connect(self._tick)
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        from PyQt6.QtWidgets import QSizePolicy
-        root = QVBoxLayout(self)
-        top = QHBoxLayout()
-        self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.clicked.connect(self.refresh)
-        self.auto_btn = QPushButton("▶ 自動刷新")
-        self.auto_btn.setCheckable(True)
-        self.auto_btn.toggled.connect(self._on_auto_toggled)
-        self.updated_label = QLabel("")
-        self.updated_label.setStyleSheet("color: #555; font-size: 11px;")
-        top.addStretch(1)
-        top.addWidget(self.updated_label)
-        top.addWidget(self.refresh_btn)
-        top.addWidget(self.auto_btn)
-        root.addLayout(top)
-
-        # 單一主 grid，col 0 = 標籤，col 1 = 值，寬度對齊 Static Info
-        self.main_grid = QGridLayout()
-        self.main_grid.setColumnMinimumWidth(0, 340)
-        self.main_grid.setColumnMinimumWidth(1, 600)
-        self.main_grid.setColumnStretch(0, 0)
-        self.main_grid.setColumnStretch(1, 1)
-        self.main_grid.setVerticalSpacing(6)
-        root.addLayout(self.main_grid)
-
-        self._main_row = 0  # 目前填到第幾行
-
-    def _on_auto_toggled(self, checked: bool) -> None:
-        if checked:
-            self.auto_btn.setText("⏸ 停止自動")
-            self._auto_timer.start()
-        else:
-            self.auto_btn.setText("▶ 自動刷新")
-            self._auto_timer.stop()
-
-    def stop_auto(self) -> None:
-        if self.auto_btn.isChecked():
-            self.auto_btn.setChecked(False)
-
-    def _tick(self) -> None:
-        if not self.ble.is_connected:
-            self.stop_auto()
-            return
-        # refresh 是 asyncSlot，可直接呼叫
-        self.refresh()
-
-    def _clear_main_grid(self) -> None:
-        while self.main_grid.count():
-            it = self.main_grid.takeAt(0)
-            w = it.widget()
-            if w:
-                w.deleteLater()
-        self._main_row = 0
-
-    def _add_row(self, key: str, value: str, key_style: str = "", val_style: str = "color: #c00;") -> None:
-        from PyQt6.QtWidgets import QSizePolicy
-        key_lbl = QLabel(key)
-        key_lbl.setStyleSheet(key_style or "font-weight: bold;")
-        key_lbl.setWordWrap(True)
-        key_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        val_lbl = QLabel(value)
-        val_lbl.setStyleSheet(val_style)
-        val_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.main_grid.addWidget(key_lbl, self._main_row, 0,
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.main_grid.addWidget(val_lbl, self._main_row, 1,
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._main_row += 1
-
-    def _add_bits_rows(self, bits: list[int], labels: list[str]) -> None:
-        for label, bit in zip(labels, bits):
-            key_lbl = QLabel(label)
-            key_lbl.setStyleSheet("border: 1px solid #bbb; padding: 2px;")
-            val_lbl = QLabel(str(bit))
-            val_lbl.setStyleSheet("color: #c00; border: 1px solid #bbb; padding: 2px;")
-            self.main_grid.addWidget(key_lbl, self._main_row, 0,
-                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            self.main_grid.addWidget(val_lbl, self._main_row, 1,
-                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            self._main_row += 1
-
-    @asyncSlot()
-    async def refresh(self) -> None:
-        if not self.ble.is_connected:
-            return
-        try:
-            data = await self.ble.read(UUID_PRU_DYNAMIC_READ)
-        except Exception as e:
-            self._clear_main_grid()
-            self._add_row("讀取失敗", str(e))
-            return
-
-        info = parse_pru_dynamic(list(data))
-        self._clear_main_grid()
-
-        if info.valid:
-            # --- optionalFieldsValidity ---
-            self._add_row("- optionalFieldsValidity",
-                          f"0x{info.optional_fields_validity:02X}")
-            self._add_bits_rows(get_bits_msb(info.optional_fields_validity),
-                                VALIDITY_BIT_LABELS)
-
-        # --- 量測值 ---
-        for k, v in info.as_display_lines():
-            self._add_row(f"- {k}", v)
-
-        if info.valid:
-            # --- pruAlert ---
-            self._add_row("- pruAlert", f"0x{info.pru_alert:02X}")
-            self._add_bits_rows(get_bits_msb(info.pru_alert),
-                                DYNAMIC_ALERT_BIT_LABELS)
-
-            # --- Tester Command ---
-            self._add_row("- Tester Command", f"0x{info.tester_cmd:02X}")
-
-        self.updated_label.setText(f"更新時間: {datetime.now().strftime('%H:%M:%S')}")
-
-
-# -------------------------------------------------------------------
-# PRU Test Page
-# -------------------------------------------------------------------
 class PruTestPage(QWidget):
     back_requested = pyqtSignal()
-    # 跨 thread 用：bleak notify callback 會在 asyncio thread 觸發，
-    # 透過 signal 轉回 Qt UI thread。
-    _notify_signal = pyqtSignal(bytes)
 
-    def __init__(self, ble: BleManager, parent=None):
+    def __init__(self, ble, parent=None):
         super().__init__(parent)
         self.ble = ble
-        self._last_alert_ts: float = 0.0  # 5 秒節流
-        self._notify_enabled = False
-        self._build_ui()
-        self._notify_signal.connect(self._on_notify_ui)
-
-    def _build_ui(self) -> None:
-        outer = QVBoxLayout(self)
-
+        self.controller = None
+        self._closing = None
+        self._init_task = None
+        root = QVBoxLayout(self)
         top = QHBoxLayout()
         self.back_btn = QPushButton("← 返回")
-        self.back_btn.clicked.connect(self._on_back_clicked)
-        self.status_banner = QLabel("")
-        self.status_banner.setStyleSheet(
-            "background-color: rgba(0,0,0,0.7); color: white; padding: 6px; border-radius: 6px;"
-        )
-        self.status_banner.setVisible(False)
+        self.back_btn.clicked.connect(self._request_back)
         top.addWidget(self.back_btn)
+        self.status_banner = QLabel()
+        self.status_banner.setWordWrap(True)
         top.addWidget(self.status_banner, 1)
-        outer.addLayout(top)
-
-        # 內容放 scroll area
+        self.retry_btn = QPushButton("重新連線 / 探索服務")
+        self.retry_btn.clicked.connect(self._retry)
+        top.addWidget(self.retry_btn)
+        root.addLayout(top)
+        self.snack = QLabel()
+        self.snack.setWordWrap(True)
+        root.addWidget(self.snack)
+        self._snack_timer = QTimer(self)
+        self._snack_timer.setSingleShot(True)
+        self._snack_timer.timeout.connect(self.snack.clear)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
         scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
+        root.addWidget(scroll)
+        body = QVBoxLayout(content)
+        self.ptu_combo, self.ptu_send_btn, self.ptu_result = self._command_row(body, "PTU Static Parameter", PACKET_STATIC_PARAMETER, "ptu")
+        self.ctrl_combo, self.ctrl_send_btn, self.ctrl_result = self._command_row(body, "PRU Control", PACKET_CONTROL, "control")
+        quick = QHBoxLayout()
+        self.disable_btn = QPushButton("快速停用 DISABLE")
+        self.enable_btn = QPushButton("快速啟用 EN_TIME_SET:0ms")
+        self.disable_btn.clicked.connect(lambda: self._send_label("control", "DISABLE"))
+        self.enable_btn.clicked.connect(lambda: self._send_label("control", "EN_TIME_SET:0ms"))
+        quick.addWidget(self.disable_btn)
+        quick.addWidget(self.enable_btn)
+        body.addLayout(quick)
+        live = QHBoxLayout()
+        self.live_btn = QPushButton("即時更新")
+        self.live_btn.setCheckable(True)
+        self.live_btn.toggled.connect(lambda on: self.controller and self.controller.set_live(on))
+        self.interval_combo = QComboBox()
+        for text, interval in (("500 ms", .5), ("1 s", 1.), ("2 s", 2.)):
+            self.interval_combo.addItem(text, interval)
+        self.interval_combo.setCurrentIndex(1)
+        self.interval_combo.currentIndexChanged.connect(lambda: self.controller and self.controller.set_poll_interval(self.interval_combo.currentData()))
+        live.addWidget(self.live_btn)
+        live.addWidget(self.interval_combo)
+        self.live_status = QLabel()
+        live.addWidget(self.live_status, 1)
+        body.addLayout(live)
+        self.static_card = InfoCard("PRU Static Info")
+        self.dynamic_card = DynamicInfoCard()
+        self.static_card.refresh_btn.clicked.connect(self._refresh_static)
+        self.dynamic_card.refresh_btn.clicked.connect(self._refresh_dynamic)
+        body.addWidget(self.dynamic_card)
+        body.addWidget(self.static_card)
+        self.alert_label = QLabel()
+        self.alert_label.setWordWrap(True)
+        body.addWidget(self.alert_label)
+        body.addWidget(QLabel("事件紀錄（最近 20 筆）"))
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumHeight(170)
+        body.addWidget(self.log_view)
+        self._age_timer = QTimer(self)
+        self._age_timer.setInterval(500)
+        self._age_timer.timeout.connect(self._render)
 
-        root = QVBoxLayout(content)
-
-        # ------- PTU Static Parameter -------
-        ptu_row = QHBoxLayout()
-        ptu_row.addWidget(QLabel("PTU Static Parameter"))
-        ptu_row.addStretch(1)
-        self.ptu_combo = QComboBox()
-        self.ptu_combo.addItems(list(PACKET_STATIC_PARAMETER.keys()))
-        ptu_row.addWidget(self.ptu_combo)
-        self.ptu_send_btn = QPushButton("發送")
-        self.ptu_send_btn.clicked.connect(self._on_ptu_send)
-        ptu_row.addWidget(self.ptu_send_btn)
-        root.addLayout(ptu_row)
-
-        # ------- PRU Control -------
-        ctrl_row = QHBoxLayout()
-        ctrl_row.addWidget(QLabel("PRU Control"))
-        ctrl_row.addStretch(1)
-        self.ctrl_combo = QComboBox()
-        self.ctrl_combo.addItems(list(PACKET_CONTROL.keys()))
-        ctrl_row.addWidget(self.ctrl_combo)
-        self.ctrl_send_btn = QPushButton("發送")
-        self.ctrl_send_btn.clicked.connect(self._on_ctrl_send)
-        ctrl_row.addWidget(self.ctrl_send_btn)
-        root.addLayout(ctrl_row)
-
-        # ------- Info Cards -------
-        self.static_card = PruStaticInfoCard(self.ble)
-        root.addWidget(self.static_card)
-        self.dynamic_card = PruDynamicInfoCard(self.ble)
-        root.addWidget(self.dynamic_card)
-
-        root.addStretch(1)
-
-    # -------------- slots --------------
-    @asyncSlot()
-    async def _on_ptu_send(self) -> None:
-        key = self.ptu_combo.currentText()
-        bytes_ = PACKET_STATIC_PARAMETER.get(key)
-        if not bytes_ or not self.ble.is_connected:
-            return
-        try:
-            await self.ble.write(UUID_PTU_STATIC_PARAM, bytes_)
-            self._flash_banner(f"✅ 已送出 PTU Static：{key}")
-        except Exception as e:
-            QMessageBox.warning(self, "發送失敗", str(e))
-
-    @asyncSlot()
-    async def _on_ctrl_send(self) -> None:
-        key = self.ctrl_combo.currentText()
-        bytes_ = PACKET_CONTROL.get(key)
-        if not bytes_ or not self.ble.is_connected:
-            return
-        try:
-            await self.ble.write(UUID_PRU_CONTROL, bytes_)
-            self._flash_banner(f"✅ 已送出 PRU Control：{key}")
-        except Exception as e:
-            QMessageBox.warning(self, "發送失敗", str(e))
-
-    def _on_back_clicked(self) -> None:
-        self.dynamic_card.stop_auto()
+    def _request_back(self):
+        if self.controller and self.controller.sending:
+            answer = QMessageBox.question(self, "指令寫入中", "現在離開將看不到寫入結果，確定離開？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self.back_requested.emit()
 
-    # -------------- notify 整合 --------------
+    def _command_row(self, layout, title, packets, group):
+        box = QGroupBox(title)
+        inner = QVBoxLayout(box)
+        row = QHBoxLayout()
+        combo = QComboBox()
+        combo.addItems(packets)
+        button = QPushButton("發送")
+        button.clicked.connect(lambda: self._send_label(group, combo.currentText()))
+        row.addWidget(combo, 1)
+        row.addWidget(button)
+        inner.addLayout(row)
+        result = QLabel()
+        result.setWordWrap(True)
+        result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        inner.addWidget(result)
+        layout.addWidget(box)
+        return combo, button, result
+
     @asyncSlot()
-    async def enter_page(self) -> None:
-        """由外部於顯示頁面時呼叫：啟用 notify + 首次 refresh。"""
-        if not self.ble.is_connected:
+    async def enter_page(self):
+        if self._closing:
+            await self._closing
+        if self.controller and not self.controller.disposed:
             return
-        # 註冊 notify callback（同步，不 await）
-        self.ble.set_notification_callback(self._on_notify_thread)
-        if not self._notify_enabled:
-            try:
-                await self.ble.enable_notify(UUID_PRU_NOTIFY)
-                self._notify_enabled = True
-            except Exception as e:
-                print(f"enable_notify 失敗: {e}")
-        # 首次載入 static / dynamic
-        await self.static_card.refresh()
-        await self.dynamic_card.refresh()
-
-    def leave_page(self) -> None:
-        self.dynamic_card.stop_auto()
-
-    def _on_notify_thread(self, uuid: str, value: bytearray) -> None:
-        """從 bleak asyncio thread 呼叫，必須 emit signal 轉回 UI thread。"""
+        self.ptu_combo.setCurrentIndex(0)
+        self.ctrl_combo.setCurrentIndex(0)
+        self.interval_combo.setCurrentIndex(1)
+        self.controller = PruController(self.ble, self._render, self._show_snack)
+        self._age_timer.start()
+        self._init_task = asyncio.create_task(self.controller.init())
         try:
-            self._notify_signal.emit(bytes(value))
-        except Exception as e:
-            print(f"notify emit 失敗: {e}")
+            await self._init_task
+        except asyncio.CancelledError:
+            pass
 
-    @pyqtSlot(bytes)
-    def _on_notify_ui(self, data: bytes) -> None:
-        if not data:
+    def leave_page(self):
+        self._age_timer.stop()
+        if self._init_task and not self._init_task.done():
+            self._init_task.cancel()
+        if self.controller and not self.controller.disposed:
+            self.controller.shutdown()
+            self._closing = asyncio.create_task(self.controller.close())
+        return self._closing
+
+    @asyncSlot()
+    async def _retry(self):
+        if not self.controller:
             return
-        # 5 秒節流
-        now = time.time()
-        if now - self._last_alert_ts < 5.0:
-            return
-        self._last_alert_ts = now
-
-        value = list(data)
-        alert_byte = value[0]
-        decoded = parse_alert_byte(alert_byte)
-        address = format_mac_from_notify(value)
-        msg = (
-            f"Alert Byte: 0x{alert_byte:02X}\n"
-            f"Address: {address}\n\n"
-            + ("\n".join(decoded) if decoded else "⚪ 無警報")
-        )
-        box = QMessageBox(self)
-        box.setWindowTitle("PRU Alert Notification")
-        box.setText(msg)
-        box.setStandardButtons(QMessageBox.StandardButton.Close)
-        box.exec()
-
-    # -------------- 狀態 banner --------------
-    def set_reconnect_status(self, text: str) -> None:
-        if text:
-            self.status_banner.setText(text)
-            self.status_banner.setVisible(True)
+        if self.controller.link_state == "reconnectFailed":
+            self.controller.reconnect()
         else:
-            self.status_banner.setVisible(False)
+            await self.controller.init()
 
-    def _flash_banner(self, text: str, ms: int = 1500) -> None:
+    @asyncSlot(str, str)
+    async def _send_label(self, group, label):
+        if self.controller:
+            result = await self.controller.send(group, label)
+            self._show_snack(f"{label}：{result.error or '已發送'}")
+
+    @asyncSlot()
+    async def _refresh_static(self):
+        if self.controller:
+            await self.controller.refresh_static()
+
+    @asyncSlot()
+    async def _refresh_dynamic(self):
+        if self.controller:
+            await self.controller.refresh_dynamic()
+
+    def _show_snack(self, text):
+        self.snack.setText(text)
+        self._snack_timer.start(5000)
+
+    def set_reconnect_status(self, text):
         self.status_banner.setText(text)
-        self.status_banner.setVisible(True)
-        QTimer.singleShot(ms, lambda: self.status_banner.setVisible(False))
+
+    def _render(self):
+        c = self.controller
+        if not c or c.disposed:
+            return
+        states = {"discovering": "探索服務中", "ready": "已連線", "reconnecting": f"重新連線 {c.reconnect_attempt}/3",
+                  "reconnectFailed": "自動重連失敗", "serviceMissing": "找不到 PRU 服務"}
+        self.status_banner.setText(states[c.link_state] + (" · " + c.link_error if c.link_error else ""))
+        self.retry_btn.setVisible(c.link_state in ("reconnectFailed", "serviceMissing"))
+        for button in (self.ptu_send_btn, self.ctrl_send_btn, self.disable_btn, self.enable_btn):
+            button.setEnabled(c.link_state == "ready" and not c.sending)
+        for card in (self.static_card, self.dynamic_card):
+            card.refresh_btn.setEnabled(c.link_state == "ready")
+        self.live_btn.blockSignals(True)
+        self.live_btn.setChecked(c.user_wants_live)
+        self.live_btn.setText("暫停即時更新" if c.user_wants_live else "啟動即時更新")
+        self.live_btn.blockSignals(False)
+        live_states = {"running": "更新中", "pausedByUser": "使用者暫停", "pausedBackground": "背景暫停",
+                       "pausedLink": "連線暫停", "pausedFailures": "連續 5 次失敗，請重新啟動即時更新"}
+        self.live_status.setText(live_states[c.live_state] + (" · 資料過期" if c.is_stale else ""))
+        for group, label in (("ptu", self.ptu_result), ("control", self.ctrl_result)):
+            r = c.results.get(group)
+            label.setText("" if r is None else f"{r.label} · {r.phase} · {r.latency * 1000:.0f} ms\n{r.error or r.response}")
+        static_rows = [] if c.static is None else c.static.as_display_lines()
+        if c.static:
+            if c.static.vrect_min_static_mv > c.static.vrect_set_mv or c.static.vrect_set_mv > c.static.vrect_high_static_mv:
+                static_rows.append(("警告", "靜態電壓門檻順序不一致"))
+            static_rows.append(("RAW", bytes(c.static.raw).hex(" ").upper()))
+        self.static_card.render(static_rows, c.static_error, c.static_loading, c.static_updated)
+        self.dynamic_card.render_model(c)
+        self.alert_label.setText(f"警報通知 {c.alert_count} 筆 · {c.last_alert}")
+        text = "\n".join(f"{at} {title} {detail}" for at, title, detail in c.log)
+        if self.log_view.toPlainText() != text:
+            self.log_view.setPlainText(text)

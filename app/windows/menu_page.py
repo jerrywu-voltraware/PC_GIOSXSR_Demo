@@ -1,4 +1,4 @@
-"""主選單頁 — 只保留「設備資訊」、「PRU 測試」兩顆按鈕。"""
+"""主選單頁，與手機版三個功能入口一致。"""
 from __future__ import annotations
 
 from PyQt6.QtCore import pyqtSignal, Qt
@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLab
 class MenuPage(QWidget):
     open_info = pyqtSignal()
     open_pru_test = pyqtSignal()
+    open_ota = pyqtSignal()
     disconnect_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -19,7 +20,7 @@ class MenuPage(QWidget):
         root = QVBoxLayout(self)
 
         top = QHBoxLayout()
-        self.back_btn = QPushButton("← 斷線並返回")
+        self.back_btn = QPushButton("← 返回掃描")
         self.back_btn.clicked.connect(self.disconnect_requested.emit)
         self.device_label = QLabel("")
         self.device_label.setStyleSheet("font-weight: bold;")
@@ -50,6 +51,11 @@ class MenuPage(QWidget):
         row.setSpacing(24)
         row.addWidget(self.info_btn)
         row.addWidget(self.pru_btn)
+        self.ota_btn = QPushButton("設備更新")
+        self.ota_btn.setStyleSheet(btn_style)
+        self.ota_btn.setMinimumHeight(80)
+        self.ota_btn.clicked.connect(self.open_ota.emit)
+        row.addWidget(self.ota_btn)
 
         wrap = QHBoxLayout()
         wrap.addStretch(1)

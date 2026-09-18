@@ -33,21 +33,18 @@ class PruStaticInfo:
             return [("狀態", "❌ 資料不足")]
         info = self.pru_information or 0
         bits = get_bits_msb(info)
-        # NOTE: Flutter 原始碼所有子項都讀 bits[2]（看起來是 bug），此處照搬以維持相同行為
-        b2 = bits[2]
         return [
             ("Optional fields validity", str(self.optional_fields_validity)),
             (". Delta R1", str(get_bits_msb(self.optional_fields_validity or 0)[7])),
             ("Protocol Revision", str(self.protocol_revision)),
             ("PRU Category", str(self.pru_category)),
             ("PRU Information", str(self.pru_information)),
-            ("PTU Test Mode", "Yes" if b2 == 1 else "No"),
-            ("Charge Complete Connected Mode", "Supported" if b2 == 1 else "Not supported"),
-            ("Adjust power capability", "Supported" if b2 == 1 else "Not supported"),
-            ("Power Control Algorithm Preference",
-             "VRECT_MIN_ERROR" if b2 == 1 else "Max System Efficiency"),
-            ("Separate BTLE radio in PRU", "Supported" if b2 == 1 else "Not supported"),
-            ("NFC receiver", "Supported" if b2 == 1 else "Not supported"),
+            ("PTU Test Mode", "Yes" if info & 0x04 else "No"),
+            ("Charge Complete Connected Mode", "Supported" if info & 0x08 else "Not supported"),
+            ("Adjust power capability", "Supported" if info & 0x10 else "Not supported"),
+            ("Power Ctrl Algo (bit5)", str(bits[2])),
+            ("Separate BTLE radio in PRU", "Supported" if info & 0x40 else "Not supported"),
+            ("NFC receiver", "Supported" if info & 0x80 else "Not supported"),
             ("Hardware rev", str(self.hardware_rev)),
             ("Firmware rev", str(self.firmware_rev)),
             ("PRECT_MAX", f"{self.prect_max_mw} mW"),
@@ -62,7 +59,7 @@ def parse_pru_static(value: list[int] | bytes) -> PruStaticInfo:
     v = list(value)
     info = PruStaticInfo(raw=v)
     if len(v) < 20:
-        return info
+        raise ValueError(f"資料長度不足 ({len(v)}/20 bytes)")
     info.optional_fields_validity = v[0]
     info.protocol_revision = v[1]
     info.pru_category = v[3]
@@ -113,7 +110,7 @@ def parse_pru_dynamic(value: list[int] | bytes) -> PruDynamicInfo:
     v = list(value)
     info = PruDynamicInfo(raw=v)
     if len(v) < 20:
-        return info
+        raise ValueError(f"資料長度不足 ({len(v)}/20 bytes)")
     info.optional_fields_validity = v[0]
     info.vrect_mv = ((v[2] << 8) | v[1]) * 10
     info.irect_ma = ((v[4] << 8) | v[3])
