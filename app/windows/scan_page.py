@@ -19,6 +19,8 @@ class ScanPage(QWidget):
         super().__init__(parent)
         self.ble = ble
         self._results: list[tuple[str, str, int]] = []  # (address, name, rssi)
+        self._device_actions_locked = False
+        self._device_action_busy = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -61,6 +63,20 @@ class ScanPage(QWidget):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #555;")
         root.addWidget(self.status_label)
+        self.recording_hint = QLabel("紀錄中：可掃描裝置；切換連線或斷線前，請返回除錯工作台停止紀錄。")
+        self.recording_hint.setWordWrap(True)
+        self.recording_hint.hide()
+        root.addWidget(self.recording_hint)
+
+    def set_device_actions_locked(self, locked):
+        self._device_actions_locked = locked
+        self.recording_hint.setVisible(locked)
+        self._update_device_actions()
+
+    def _update_device_actions(self):
+        enabled = not self._device_actions_locked and not self._device_action_busy
+        self.connect_btn.setEnabled(enabled)
+        self.disconnect_btn.setEnabled(enabled)
 
     def _render_list(self) -> None:
         self.list_widget.clear()
@@ -83,20 +99,20 @@ class ScanPage(QWidget):
     @asyncSlot()
     async def _disconnect_selected(self):
         item = self.list_widget.currentItem()
-        if not item or not self.connect_btn.isEnabled():
+        if not item or self._device_actions_locked or not self.connect_btn.isEnabled():
             return
         address, name = item.data(Qt.ItemDataRole.UserRole)
         if address not in dict(self.ble.connected_devices()):
             return
-        self.disconnect_btn.setEnabled(False)
-        self.connect_btn.setEnabled(False)
+        self._device_action_busy = True
+        self._update_device_actions()
         try:
             await self.ble.connect(address)
             await self.ble.disconnect()
             self._render_list()
         finally:
-            self.disconnect_btn.setEnabled(True)
-            self.connect_btn.setEnabled(True)
+            self._device_action_busy = False
+            self._update_device_actions()
 
     @asyncSlot()
     async def start_scan(self) -> None:
@@ -135,11 +151,11 @@ class ScanPage(QWidget):
 
     @asyncSlot()
     async def _connect_to_item(self, item: QListWidgetItem) -> None:
-        if not self.connect_btn.isEnabled():
+        if self._device_actions_locked or not self.connect_btn.isEnabled():
             return
         address, name = item.data(Qt.ItemDataRole.UserRole)
-        self.connect_btn.setEnabled(False)
-        self.disconnect_btn.setEnabled(False)
+        self._device_action_busy = True
+        self._update_device_actions()
         self.scan_btn.setEnabled(False)
         self.status_label.setText(f"連線 {name} ...")
         try:
@@ -151,6 +167,6 @@ class ScanPage(QWidget):
             QMessageBox.warning(self, "連線失敗", f"連線失敗：{e}")
             self.status_label.setText("連線失敗")
         finally:
-            self.connect_btn.setEnabled(True)
-            self.disconnect_btn.setEnabled(True)
+            self._device_action_busy = False
+            self._update_device_actions()
             self.scan_btn.setEnabled(True)

@@ -29,12 +29,12 @@ log = workspace / 'apply.log'
 shutil.copyfile(source_exe, download)
 target.write_bytes(b'Previous application placeholder')
 text = _install_script_text(download, target, 2147483647, log)
-restart = 'Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)'
+restart = 'Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) -WindowStyle Hidden'
 assert restart in text
-text = text.replace(restart, "$smokeProcess = " + restart + " -WindowStyle Hidden -ArgumentList '--ui-smoke' -Wait -PassThru\n    if ($smokeProcess.ExitCode -ne 0) { throw 'Smoke restart failed' }")
+text = text.replace(restart, "$smokeProcess = " + restart + " -ArgumentList '--ui-smoke' -Wait -PassThru\n    if ($smokeProcess.ExitCode -ne 0) { throw 'Smoke restart failed' }")
 script.write_text(text, encoding='utf-8-sig')
 result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)],
-                        capture_output=True, timeout=45)
+                        capture_output=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
 assert result.returncode == 0, result.stderr
 assert digest(source_exe) == digest(target), 'Installed binary hash differs'
 assert not download.exists(), 'Download cleanup did not complete'

@@ -138,3 +138,26 @@ def format_mac_from_notify(value: list[int] | bytes) -> str:
     if len(v) < 7:
         return "無"
     return ":".join(f"{b:02x}" for b in v[1:7]).upper()
+
+
+@dataclass(frozen=True)
+class AlertNotification:
+    raw: bytes
+    alert_byte: int
+    address: str
+    flags: tuple[str, ...]
+
+    @property
+    def decoded(self):
+        return "\n".join(self.flags) or "⚪ 無警報"
+
+    @property
+    def is_fault(self):
+        return bool(self.alert_byte & 0xF0)
+
+
+def parse_alert_notification(raw) -> AlertNotification:
+    if not raw:
+        raise ValueError("警報資料為空")
+    return AlertNotification(bytes(raw), raw[0], format_mac_from_notify(raw),
+                             tuple(parse_alert_byte(raw[0])))

@@ -11,6 +11,7 @@ from qasync import QEventLoop
 from app.windows.main_window import MainWindow
 from app.theme import apply_theme
 from test_mobile_parity import FakeGatt
+from app.constants import UUID_PRU_NOTIFY
 
 
 async def smoke(app):
@@ -67,9 +68,36 @@ async def smoke(app):
     assert controller.live_state == "pausedByUser"
     window.pru_page.interval_combo.setCurrentIndex(0)
     assert controller.poll_interval == .5
-    output = Path(__file__).resolve().parents[1] / "artifacts"
+    output = Path(os.environ.get('GIOS_TEST_ARTIFACTS', Path(__file__).resolve().parents[1] / 'artifacts'))
     output.mkdir(exist_ok=True)
     assert window.grab().save(str(output / "pru_desktop.png"))
+    # Exercise notification actions and the expanded view under the real Qt/async bridge.
+    raw = bytearray(20)
+    raw[0], raw[9], raw[16] = 0xdc, 65, 0x88
+    for offset, value in ((1, 500), (3, 120), (5, 490), (7, 110), (10, 400), (12, 500), (14, 600)):
+        raw[offset:offset+2] = value.to_bytes(2, 'little')
+    fake.dynamic_raw = raw
+    static_raw = bytearray(20)
+    static_raw[3], static_raw[4], static_raw[5], static_raw[6], static_raw[7] = 3, 0x84, 0xF1, 0xE3, 5
+    for offset, value in ((8, 350), (12, 450), (10, 650)):
+        static_raw[offset:offset+2] = value.to_bytes(2, 'little')
+    fake.static_raw = static_raw
+    await controller.refresh_static()
+    await controller.refresh_dynamic()
+    fake.callback(UUID_PRU_NOTIFY, bytes.fromhex('88 01 02 03 04 05 06'))
+    assert window.pru_page.snack_action_btn.text() == '詳細'
+    window.pru_page.snack_action_btn.click()
+    app.processEvents()
+    dialog = window.pru_page._alert_dialog
+    assert '01:02:03:04:05:06' in dialog.text()
+    assert dialog.grab().save(str(output / 'pru_alert_detail.png'))
+    dialog.close()
+    window.pru_page.static_card.expand_btn.click()
+    app.processEvents()
+    assert not window.pru_page.static_card.details.isHidden()
+    assert window.pru_page.scroll.widget().grab().save(str(output / 'pru_feedback_full.png'))
+    assert window.pru_page.dynamic_card.alert_bits.chips[0].property('level') == 'error'
+    assert window.pru_page.dynamic_card.alert_bits.chips[4].property('level') == 'success'
     await window._back_to_menu()
     assert controller.disposed
     await window._back_to_scan()
@@ -79,9 +107,11 @@ async def smoke(app):
     await asyncio.sleep(.6)
     assert window.pru_page.controller is not controller
     assert window.pru_page.controller.alert_count == 0
+    assert window.pru_page.static_card.details.isHidden()
+    assert window.pru_page.snack_box.isHidden()
     await window._shutdown()
     assert not fake.is_connected
-    print("PASS: 5 pages; no DAC; controller-driven PRU; quick commands; pause/interval; retained connection; page reentry; clean shutdown")
+    print("PASS: 5 pages; PRU commands; pause/interval; alert detail; mixed flag colors; static collapse; retained connection; clean reentry/shutdown")
 
 
 app = QApplication([])

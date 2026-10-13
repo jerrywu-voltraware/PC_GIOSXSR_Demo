@@ -8,10 +8,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (QWidget, QFrame, QGroupBox, QVBoxLayout, QHBoxLayout,
                             QGridLayout, QLabel, QPushButton)
 from ..constants import DYNAMIC_ALERT_BIT_LABELS
-
-PRIMARY = '#116360'
-ERROR = '#c62828'
-WARNING = '#b36a00'
+from .pru_widgets import PRIMARY, ERROR, WARNING, BitChips, set_badge
 
 
 def thresholds(dynamic, static):
@@ -42,9 +39,9 @@ class MetricTile(QFrame):
         super().__init__()
         self.unit = unit
         self.setObjectName('metricTile')
-        self.setMinimumHeight(103)
+        self.setMinimumHeight(91)
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 9, 14, 9)
+        root.setContentsMargins(9, 8, 9, 8)
         self.title = QLabel(label)
         root.addWidget(self.title)
         line = QHBoxLayout()
@@ -67,7 +64,7 @@ class MetricTile(QFrame):
         border = '#e7a09c' if alert and valid else '#d2e0e0'
         self.setStyleSheet(f'QFrame#metricTile {{ background: {background}; border: 1px solid {border}; border-radius: 8px; }}')
         self.value_label.setText(str(value) if valid else '—')
-        self.value_label.setStyleSheet(f'font-size: 28px; font-weight: 700; color: {color};')
+        self.value_label.setStyleSheet(f'font-size: 25px; font-weight: 700; color: {color};')
         self.unit_label.setText(self.unit + (' (無效)' if value is not None and not valid else ''))
         self.unit_label.setStyleSheet(f'color: {color};')
         self.note_label.setText(note if valid else '')
@@ -133,7 +130,10 @@ class DynamicInfoCard(QGroupBox):
         self.content = QWidget()
         body = QVBoxLayout(self.content)
         body.setContentsMargins(0, 0, 0, 0)
-        grid = QGridLayout()
+        self.metric_grid = QGridLayout()
+        grid = self.metric_grid
+        self._columns = 2
+        self._displayed_at = None
         self.tiles = {}
         for index, (name, unit) in enumerate((('VRECT', 'mV'), ('IRECT', 'mA'), ('VOUT', 'mV'), ('IOUT', 'mA'))):
             tile = MetricTile(name, unit)
@@ -158,10 +158,16 @@ class DynamicInfoCard(QGroupBox):
         self.source_label = QLabel()
         ranges.addWidget(self.source_label)
         body.addWidget(self.range_section)
+        self.details_btn = QPushButton('展開工程詳情 · 門檻 / Alert bits / Tester')
+        self.details_btn.setCheckable(True)
+        body.addWidget(self.details_btn)
+        self.details = QWidget()
+        details_body = QVBoxLayout(self.details)
+        details_body.setContentsMargins(0, 0, 0, 0)
         self.temperature = QLabel()
         self.temperature.setStyleSheet('color: #8a9898;')
-        body.addWidget(self.temperature)
-        body.addWidget(QLabel('動態門檻'))
+        details_body.addWidget(self.temperature)
+        details_body.addWidget(QLabel('動態門檻'))
         rows = QGridLayout()
         self.threshold_labels = []
         for index, name in enumerate(('VRECT_MIN_DYN', 'VRECT_SET_DYN', 'VRECT_HIGH_DYN')):
@@ -170,32 +176,61 @@ class DynamicInfoCard(QGroupBox):
             rows.addWidget(value, index, 1)
             self.threshold_labels.append(value)
         rows.setColumnStretch(1, 1)
-        body.addLayout(rows)
+        details_body.addLayout(rows)
         self.inconsistent = QLabel('門檻順序矛盾 (MIN ≤ SET ≤ HIGH)')
         self.inconsistent.setStyleSheet(f'color: {ERROR};')
-        body.addWidget(self.inconsistent)
+        details_body.addWidget(self.inconsistent)
         self.validity = QLabel()
-        body.addWidget(self.validity)
+        details_body.addWidget(self.validity)
         self.alert = QLabel()
         self.alert.setWordWrap(True)
         body.addWidget(self.alert)
+        self.no_alert = QLabel()
+        set_badge(self.no_alert, '無警報', 'success')
+        body.addWidget(self.no_alert)
+        self.alert_bits = BitChips(DYNAMIC_ALERT_BIT_LABELS, alert=True)
+        details_body.addWidget(self.alert_bits)
         self.tester = QLabel()
-        body.addWidget(self.tester)
-        self.raw = QLabel()
-        self.raw.setWordWrap(True)
-        self.raw.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.raw.setStyleSheet('color: #657879; font-size: 11px;')
-        body.addWidget(self.raw)
+        details_body.addWidget(self.tester)
+        body.addWidget(self.details)
+        self.details.hide()
+        self.details_btn.toggled.connect(self._toggle_details)
         root.addWidget(self.content)
         self.content.hide()
         self.failure_label.hide()
 
-    def render_model(self, controller):
+    def _toggle_details(self, expanded):
+        self.details.setVisible(expanded)
+        self.details_btn.setText(('收合' if expanded else '展開') + '工程詳情 · 門檻 / Alert bits / Tester')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        columns = 4 if self.width() >= 530 else 2
+        if columns == self._columns:
+            return
+        self._columns = columns
+        for index, tile in enumerate(self.tiles.values()):
+            self.metric_grid.removeWidget(tile)
+            self.metric_grid.addWidget(tile, index // columns, index % columns)
+        for index in range(4):
+            self.metric_grid.setColumnStretch(index, int(index < columns))
+
+    def render_model(self, controller, frozen=False):
         c, d = controller, controller.dynamic
         stamp = datetime.fromtimestamp(time.time() - (time.monotonic() - c.dynamic_updated)).strftime('%H:%M:%S') if c.dynamic_updated is not None else '—'
         self.status.setText(('讀取中…' if c.dynamic_loading else (c.dynamic_error or '尚無資料')) if d is None else f'最後更新 {stamp}')
         self.failure_label.setText(f'最近讀取失敗 ×{c.failures}：{c.dynamic_error}')
-        self.failure_label.setVisible(d is not None and c.failures > 0)
+        self.failure_label.setVisible(bool(c.dynamic_error) or c.failures > 0)
+        if d is not None:
+            set_badge(self.alert, f'目前 PRU Alert 0x{d.pru_alert:02X}',
+                      'error' if d.pru_alert & 0xf0 else 'warning' if d.pru_alert else 'muted')
+            self.no_alert.setVisible(d.pru_alert == 0)
+            self.alert_bits.setVisible(d.pru_alert != 0)
+            self.alert_bits.set_byte(d.pru_alert)
+        if frozen:
+            self.status.setText(f'畫面凍結於 {self._displayed_at or "—"} · 收集狀態見上方')
+            return
+        self._displayed_at = stamp
         self.content.setVisible(d is not None)
         if d is None:
             return
@@ -223,8 +258,4 @@ class DynamicInfoCard(QGroupBox):
             label.setStyleSheet(f'color: {ERROR if inconsistent else "#183d40"};')
         self.inconsistent.setVisible(inconsistent)
         self.validity.setText(f'狀態    Validity 0x{d.optional_fields_validity:02X}')
-        active = [label for i, label in enumerate(DYNAMIC_ALERT_BIT_LABELS) if d.pru_alert & (0x80 >> i)]
-        self.alert.setText(f'PRU Alert 0x{d.pru_alert:02X}    ' + (' · '.join(active) if active else '無警報'))
-        self.alert.setStyleSheet(f'color: {ERROR if d.pru_alert & 0xf0 else PRIMARY};')
         self.tester.setText(f'Tester Command    0x{d.tester_cmd:02X}')
-        self.raw.setText('RAW    ' + bytes(d.raw).hex(' ').upper())

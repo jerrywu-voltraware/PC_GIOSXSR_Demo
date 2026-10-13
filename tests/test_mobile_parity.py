@@ -23,6 +23,7 @@ class FakeGatt:
         self.active = self.max_active = 0
         self.delay = 0
         self.dynamic_raw = bytes(20)
+        self.static_raw = bytes(20)
         self.fail_reads = False
         self.fail_connects = 0
         self.fail_notify = False
@@ -70,7 +71,7 @@ class FakeGatt:
         async with self.operation(("read", uuid)):
             if self.fail_reads:
                 raise RuntimeError("read failed")
-            return bytes(20) if uuid == UUID_PRU_STATIC_READ else self.dynamic_raw
+            return self.static_raw if uuid == UUID_PRU_STATIC_READ else self.dynamic_raw
 
     async def write_pru(self, uuid, payload):
         async with self.operation(("write", uuid, bytes(payload))):
@@ -157,7 +158,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.ble.fail_notify = True
         await self.c.init()
         self.assertEqual(self.c.link_state, "ready")
-        self.assertTrue(any("警報通知啟用失敗" in e[1] for e in self.c.log))
+        self.assertTrue(any("警報通知啟用失敗" in e.title for e in self.c.log))
 
     async def test_gatt_operations_do_not_overlap_and_send_is_guarded(self):
         await self.ready_paused()
@@ -212,7 +213,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(25):
             self.c.on_notification(UUID_PRU_NOTIFY, bytes.fromhex("80 01 02 03 04 05 06"))
         self.assertEqual(self.c.alert_count, 25)
-        self.assertEqual(len(self.c.log), 20)
+        self.assertEqual(len(self.c.log), 25)
         self.assertEqual(len(self.snacks), 1)
         self.assertIn("01:02:03:04:05:06", self.c.last_alert)
         self.c.on_notification("other", b"\x80")

@@ -86,6 +86,6 @@ class DynamicCardTests(unittest.TestCase):
         self.card.render_model(c)
         self.card.show()
         self.app.processEvents()
-        output = Path(__file__).resolve().parents[1] / 'artifacts'
+        output = Path(os.environ.get('GIOS_TEST_ARTIFACTS', Path(__file__).resolve().parents[1] / 'artifacts'))
         output.mkdir(exist_ok=True)
         self.assertTrue(self.card.grab().save(str(output / 'dynamic_mobile_style.png')))

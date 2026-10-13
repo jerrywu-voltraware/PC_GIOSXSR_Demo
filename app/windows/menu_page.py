@@ -42,7 +42,7 @@ class MenuPage(QWidget):
         self.info_btn.setMinimumHeight(80)
         self.info_btn.clicked.connect(self.open_info.emit)
 
-        self.pru_btn = QPushButton("PRU 測試")
+        self.pru_btn = QPushButton("除錯工作台")
         self.pru_btn.setStyleSheet(btn_style)
         self.pru_btn.setMinimumHeight(80)
         self.pru_btn.clicked.connect(self.open_pru_test.emit)

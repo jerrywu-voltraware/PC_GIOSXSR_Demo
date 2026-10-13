@@ -92,12 +92,15 @@ def _install_script_text(
 $source = {_powershell_literal(source)}
 $target = {_powershell_literal(target)}
 $backup = "$target.old"
+$stage = "$target.update-$([Guid]::NewGuid().ToString('N')).tmp"
 $pidToWait = {wait_pid}
 $logFile = {_powershell_literal(log_file)}
+$installed = $false
+$originalHash = $null
 
 function Write-UpdateLog([string]$message) {{
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Add-Content -LiteralPath $logFile -Value "[$timestamp] $message"
+    Add-Content -LiteralPath $logFile -Value "[$timestamp] $message" -Encoding utf8
 }}
 
 function Get-TargetProcesses {{
@@ -118,61 +121,92 @@ try {{
     }}
 
     $leftover = @(Get-TargetProcesses)
-    if ($leftover.Count -gt 0) {{
-        Write-UpdateLog "Force stopping leftover processes: $(($leftover | ForEach-Object Id) -join ', ')"
-        $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
+    $byPid = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue
+    if ($leftover.Count -gt 0 -or $byPid) {{
+        Write-UpdateLog "Update deferred: an application process is still running. Download retained at $source. Close all instances and retry."
+        exit 2
     }}
 
-    $sourceSize = (Get-Item -LiteralPath $source).Length
-    $installed = $false
+    if (Test-Path -LiteralPath $backup) {{
+        throw "Previous backup exists at $backup; it was preserved. Inspect it before retrying."
+    }}
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    if (Test-Path -LiteralPath $target) {{
+        $originalHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+    }}
 
     for ($attempt = 1; $attempt -le 60; $attempt++) {{
         try {{
-            if (Test-Path -LiteralPath $backup) {{
-                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            # Complete and verify a same-volume staging file before touching target.
+            Copy-Item -LiteralPath $source -Destination $stage -Force -ErrorAction Stop
+            $stageHash = (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash
+            if ($stageHash -ne $sourceHash) {{
+                throw "SHA256 mismatch in staging file."
+            }}
+            if (@(Get-TargetProcesses).Count -gt 0) {{
+                Write-UpdateLog "Update deferred: an application reopened. Download retained at $source."
+                exit 2
             }}
             if (Test-Path -LiteralPath $target) {{
-                Move-Item -LiteralPath $target -Destination $backup -Force -ErrorAction Stop
+                [System.IO.File]::Replace($stage, $target, $backup)
+            }} else {{
+                [System.IO.File]::Move($stage, $target)
             }}
-            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
-            $targetSize = (Get-Item -LiteralPath $target).Length
-            if ($targetSize -ne $sourceSize) {{
-                throw "Size mismatch after copy: $targetSize vs $sourceSize."
+            $targetHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+            if ($targetHash -ne $sourceHash) {{
+                throw "SHA256 mismatch after replacement."
             }}
-            Write-UpdateLog "Updated $target from $source on attempt $attempt."
+            Write-UpdateLog "Updated $target from $source on attempt $attempt; SHA256 $targetHash."
             $installed = $true
             break
         }} catch {{
             Write-UpdateLog "Attempt $attempt failed: $($_.Exception.Message)"
-            if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) {{
-                try {{ Move-Item -LiteralPath $backup -Destination $target -Force -ErrorAction Stop }} catch {{ }}
+            if (Test-Path -LiteralPath $backup) {{
+                try {{
+                    if (Test-Path -LiteralPath $target) {{
+                        # PS 5.1 binds $null as an empty path for this overload.
+                        # Keep the rejected image in stage until finally removes it.
+                        [System.IO.File]::Replace($backup, $target, $stage)
+                    }} else {{
+                        [System.IO.File]::Move($backup, $target)
+                    }}
+                    Write-UpdateLog "Restored previous target after failed replacement."
+                }} catch {{
+                    Write-UpdateLog "Rollback failed: $($_.Exception.Message). Keep backup and download for recovery."
+                    exit 1
+                }}
             }}
             Start-Sleep -Seconds 1
         }}
     }}
 
     if (-not $installed) {{
-        Write-UpdateLog "Update failed after all retry attempts. Restarting existing app."
+        throw "Update failed after all retry attempts. Download retained at $source."
     }}
     Start-Sleep -Seconds 3
-    Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)
-    if ($installed) {{
-        Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    if (@(Get-TargetProcesses).Count -eq 0) {{
+        Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) -WindowStyle Hidden
+        Write-UpdateLog "Started updated application. Backup is retained until application startup cleanup."
+    }} else {{
+        Write-UpdateLog "Updated application is already running; no duplicate restart."
     }}
+    Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }} catch {{
-    try {{ Write-UpdateLog "Fatal updater error: $($_.Exception.Message)" }} catch {{ }}
+    try {{ Write-UpdateLog "Updater stopped: $($_.Exception.Message). Download and any backup retained."
+    }} catch {{ }}
     try {{
-        if (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) {{
-            Move-Item -LiteralPath $backup -Destination $target -Force
+        # Only restart a verified previous target, never a partial or unknown file.
+        if (-not $installed -and $originalHash -and (Test-Path -LiteralPath $target) -and
+            @(Get-TargetProcesses).Count -eq 0 -and
+            (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $originalHash) {{
+            Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) -WindowStyle Hidden
+            Write-UpdateLog "Restarted verified previous application; update was not installed."
         }}
     }} catch {{ }}
-    try {{
-        Start-Sleep -Seconds 3
-        Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)
-    }} catch {{ }}
+    exit 1
+}} finally {{
+    Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
 }}
 """
 
@@ -270,6 +304,8 @@ class UpdateController(QObject):
         self._progress_dialog: QProgressDialog | None = None
 
     def check_for_updates(self, manual: bool = False) -> None:
+        if getattr(self._parent, "recording_active", False):
+            return
         if self._checking:
             if manual:
                 QMessageBox.information(self._parent, "檢查更新", "正在檢查更新，請稍候。")
@@ -284,6 +320,9 @@ class UpdateController(QObject):
         self._checking = False
         manual = self._manual_check
         self._manual_check = False
+
+        if getattr(self._parent, "recording_active", False):
+            return
 
         if error:
             if manual:
@@ -378,6 +417,9 @@ class UpdateController(QObject):
             self._install_update(path)
 
     def _install_update(self, downloaded_exe: Path) -> None:
+        if getattr(self._parent, "recording_active", False):
+            QMessageBox.information(self._parent, "安裝更新", "請先停止紀錄，再安裝更新。")
+            return
         target = Path(sys.executable).resolve()
         script = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.ps1"
         log_file = Path(tempfile.gettempdir()) / f"{APP_NAME}-apply-update.log"
@@ -397,7 +439,8 @@ class UpdateController(QObject):
             ],
             creationflags=creation_flags,
         )
-        QApplication.quit()
+        # MainWindow.closeEvent drains the recording writer before exiting.
+        self._parent.close()
 
     def _start_worker(self, worker: QObject, finished_slot) -> None:
         thread = QThread(self)
